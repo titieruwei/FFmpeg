@@ -1655,7 +1655,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     double bitrate;
     double speed;
     int64_t pts = INT64_MIN + 1;
-    static int64_t last_time = -1;
+    //static int64_t last_time = -1;
     static int qp_histogram[52];
     int hours, mins, secs, us;
     int ret;
@@ -1664,7 +1664,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     if (!print_stats && !is_last_report && !progress_avio)
         return;
 
-    if (!is_last_report) {
+    /*if (!is_last_report) {
         if (last_time == -1) {
             last_time = cur_time;
             return;
@@ -1672,7 +1672,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         if ((cur_time - last_time) < 500000)
             return;
         last_time = cur_time;
-    }
+    }*/
 
     t = (cur_time-timer_start) / 1000000.0;
 
@@ -1810,9 +1810,9 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     if (print_stats || is_last_report) {
         const char end = is_last_report ? '\n' : '\r';
         if (print_stats==1 && AV_LOG_INFO > av_log_get_level()) {
-            fprintf(stderr, "%s    %c", buf, end);
+            fprintf(stderr, "%s    %c\r\n", buf, end);
         } else
-            av_log(NULL, AV_LOG_INFO, "%s    %c", buf, end);
+            av_log(NULL, AV_LOG_INFO, "%s    %c\r\n", buf, end);
 
     fflush(stderr);
     }
@@ -4574,6 +4574,7 @@ static int transcode(void)
     InputStream *ist;
     int64_t timer_start;
     int64_t total_packets_written = 0;
+	int64_t report_time, chk_time;
 
     ret = transcode_init();
     if (ret < 0)
@@ -4583,7 +4584,7 @@ static int transcode(void)
         av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [?] for help\n");
     }
 
-    timer_start = av_gettime_relative();
+    chk_time = report_time = timer_start = av_gettime_relative();
 
 #if HAVE_PTHREADS
     if ((ret = init_input_threads()) < 0)
@@ -4614,7 +4615,18 @@ static int transcode(void)
         }
 
         /* dump report by using the output first video and audio streams */
-        print_report(0, timer_start, cur_time);
+		if(cur_time - report_time > 30 * 60 * 1000 * 1000)
+		{
+        	print_report(0, timer_start, cur_time);
+			report_time = cur_time;
+		}
+
+		if(cur_time - chk_time > 10 * 1000 * 1000)
+		{
+			chk_time = cur_time;
+			if(access("ffmpeg.kill", F_OK) == 0)
+				break;
+		}
     }
 #if HAVE_PTHREADS
     free_input_threads();

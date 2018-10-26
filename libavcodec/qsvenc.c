@@ -989,7 +989,7 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
     mfxSyncPoint *sync     = NULL;
     QSVFrame *qsv_frame = NULL;
     mfxEncodeCtrl* enc_ctrl = NULL;
-    int ret;
+    int ret, timeout = 0;
 
     if (frame) {
         ret = submit_frame(q, frame, &qsv_frame);
@@ -1030,9 +1030,11 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
 
     do {
         ret = MFXVideoENCODE_EncodeFrameAsync(q->session, enc_ctrl, surf, bs, sync);
-        if (ret == MFX_WRN_DEVICE_BUSY)
-            av_usleep(500);
-    } while (ret == MFX_WRN_DEVICE_BUSY || ret == MFX_WRN_IN_EXECUTION);
+        if (ret == MFX_WRN_DEVICE_BUSY || ret == MFX_WRN_IN_EXECUTION)
+            av_usleep(1000);
+		if(timeout++ > 5 * 1000)
+			exit(0);
+    } while ((ret == MFX_WRN_DEVICE_BUSY || ret == MFX_WRN_IN_EXECUTION));
 
     if (ret > 0)
         ff_qsv_print_warning(avctx, ret, "Warning during encoding");
@@ -1064,7 +1066,7 @@ static int encode_frame(AVCodecContext *avctx, QSVEncContext *q,
 int ff_qsv_encode(AVCodecContext *avctx, QSVEncContext *q,
                   AVPacket *pkt, const AVFrame *frame, int *got_packet)
 {
-    int ret;
+    int ret, timeout = 0;
 
     ret = encode_frame(avctx, q, frame);
     if (ret < 0)
@@ -1082,6 +1084,10 @@ int ff_qsv_encode(AVCodecContext *avctx, QSVEncContext *q,
 
         do {
             ret = MFXVideoCORE_SyncOperation(q->session, *sync, 1000);
+			if (ret == MFX_WRN_IN_EXECUTION)
+            	av_usleep(1000);
+			if(timeout++ > 5 * 1000)
+				exit(0);
         } while (ret == MFX_WRN_IN_EXECUTION);
 
         new_pkt.dts  = av_rescale_q(bs->DecodeTimeStamp, (AVRational){1, 90000}, avctx->time_base);

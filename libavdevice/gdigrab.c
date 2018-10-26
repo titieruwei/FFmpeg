@@ -274,6 +274,11 @@ gdigrab_read_header(AVFormatContext *s1)
         goto error;
     }
     bpp = GetDeviceCaps(source_hdc, BITSPIXEL);
+	if(bpp != 32)
+	{
+		av_log(s1, AV_LOG_WARNING, "Warning:gdigrab will convert %dbpp to 32bpp!", bpp);
+		bpp = 32;
+	}
 
     if (hwnd) {
         GetClientRect(hwnd, &virtual_rect);
@@ -527,7 +532,15 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
     BITMAPFILEHEADER bfh;
     int file_size = gdigrab->header_size + gdigrab->frame_size;
 
+	static int64_t stime = 0;
     int64_t curtime, delay;
+	static int64_t curtime1 = 0;
+	
+	typedef  void*  (WINAPI *ImageSearchFunc)(int32_t x1, int32_t y1, int32_t right, int32_t buttom, char* image);
+	static HMODULE hModule = NULL;
+	static ImageSearchFunc DXGICapture = NULL;
+	static int err_count = 0;
+	static int64_t idle_time = 0;
 
     /* Calculate the time of the next frame */
     time_frame += INT64_C(1000000);
@@ -541,21 +554,101 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
         curtime = av_gettime();
         delay = time_frame * av_q2d(time_base) - curtime;
         if (delay <= 0) {
-            if (delay < INT64_C(-1000000) * av_q2d(time_base)) {
-                time_frame += INT64_C(1000000);
+			if(curtime - curtime1 < INT64_C(1000000) * av_q2d(time_base) / 2)
+			{
+				//if (s1->flags & AVFMT_FLAG_NONBLOCK)
+            		//return AVERROR(EAGAIN);
+				delay = INT64_C(1000000) * av_q2d(time_base) / 2 - (curtime - curtime1);
+				av_usleep(delay);
+				idle_time += av_gettime() - curtime;
+				continue;
+			}
+			
+			if (delay < INT64_C(-1000000) * av_q2d(time_base)) {
+				int frm_cnt = delay / (INT64_C(-1000000) * av_q2d(time_base));
+					
+                time_frame += INT64_C(1000000) * frm_cnt;
+				idle_time -= INT64_C(1000000) * av_q2d(time_base) * frm_cnt;
             }
             break;
         }
-        if (s1->flags & AVFMT_FLAG_NONBLOCK) {
+
+		if(curtime - curtime1 >= INT64_C(1000000) * av_q2d(time_base) * 2)
+			break;
+        /*if (s1->flags & AVFMT_FLAG_NONBLOCK) {
             return AVERROR(EAGAIN);
-        } else {
+        } else */{
+        	if(INT64_C(1000000) * av_q2d(time_base) * 2 - (curtime - curtime1) < delay)
+				delay = INT64_C(1000000) * av_q2d(time_base) * 2 - (curtime - curtime1);
+
             av_usleep(delay);
+			idle_time += av_gettime() - curtime;
         }
     }
+	if(stime == 0)
+		stime = curtime;
+	if(curtime - stime > 10 * 60 * 1000 * 1000)
+	{
+		static int last_fps = 0;
+		int fps;
+		
+		idle_time += delay;
+		fps = (int)(1 / av_q2d(time_base) + (idle_time / (INT64_C(1000000) * av_q2d(time_base))) / ((curtime - stime) / (1000 * 1000)) + 0.1);
+		if(last_fps != fps)
+		{
+			last_fps = fps;
+			av_log(NULL, AV_LOG_INFO, "fps test:%d\n", fps);
+		}
+		idle_time = 0;
+		stime = curtime;
+	}
+	curtime1 = curtime;
 
     if (av_new_packet(pkt, file_size) < 0)
         return AVERROR(ENOMEM);
-    pkt->pts = curtime;
+	pkt->pts = time_frame * av_q2d(time_base);//curtime;
+
+	if(err_count < 3 && DXGICapture == NULL)
+	{
+		hModule = LoadLibrary(TEXT("DXGICapture.dll"));	
+		if(hModule)
+			DXGICapture = (ImageSearchFunc)GetProcAddress(hModule, "DXGICapture");	
+		if(DXGICapture == NULL)
+			err_count++;
+	}
+	if(err_count < 5 && hModule && DXGICapture)
+	{
+		memset(pkt->data + gdigrab->header_size, 0, 16);
+		if(DXGICapture(clip_rect.left, clip_rect.top, clip_rect.right
+						, clip_rect.bottom, pkt->data + gdigrab->header_size) != NULL)
+		{
+			unsigned int testd0, testd1;
+
+			if(err_count > -255)
+				err_count--;
+			if(sscanf(pkt->data + gdigrab->header_size, "DXGI %x %x DXGI", &testd0, &testd1) == 2)
+			{
+		 		/* Copy bits to packet data */
+			    bfh.bfType = 0x4d42; /* "BM" in little-endian */
+			    bfh.bfSize = file_size;
+			    bfh.bfReserved1 = 0;
+			    bfh.bfReserved2 = 0;
+			    bfh.bfOffBits = gdigrab->header_size;
+
+			    memcpy(pkt->data, &bfh, sizeof(bfh));
+			    memcpy(pkt->data + sizeof(bfh), &gdigrab->bmi.bmiHeader, sizeof(gdigrab->bmi.bmiHeader));
+				
+				gdigrab->time_frame = time_frame;
+
+		    	return gdigrab->header_size + gdigrab->frame_size;
+			}
+		}
+		else
+		{
+			av_log(NULL, AV_LOG_ERROR, "DXGICapture error, %d!\n", err_count);
+			err_count++;
+		}
+	}
 
     /* Blit screen grab */
     if (!BitBlt(dest_hdc, 0, 0,
@@ -585,7 +678,9 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
         GetDIBColorTable(dest_hdc, 0, 1 << gdigrab->bmi.bmiHeader.biBitCount,
                 (RGBQUAD *) (pkt->data + sizeof(bfh) + sizeof(gdigrab->bmi.bmiHeader)));
 
-    memcpy(pkt->data + gdigrab->header_size, gdigrab->buffer, gdigrab->frame_size);
+    //memcpy(pkt->data + gdigrab->header_size, gdigrab->buffer, gdigrab->frame_size);
+    sprintf((char *)pkt->data + gdigrab->header_size, "DXGI %x %x DXGI"
+    			, (uint32_t)gdigrab->buffer, (uint32_t)(gdigrab->frame_size / (clip_rect.bottom - clip_rect.top)));
 
     gdigrab->time_frame = time_frame;
 
@@ -622,7 +717,7 @@ static int gdigrab_read_close(AVFormatContext *s1)
 static const AVOption options[] = {
     { "draw_mouse", "draw the mouse pointer", OFFSET(draw_mouse), AV_OPT_TYPE_INT, {.i64 = 1}, 0, 1, DEC },
     { "show_region", "draw border around capture area", OFFSET(show_region), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, DEC },
-    { "framerate", "set video frame rate", OFFSET(framerate), AV_OPT_TYPE_VIDEO_RATE, {.str = "ntsc"}, 0, INT_MAX, DEC },
+    { "framerate", "set video frame rate", OFFSET(framerate), AV_OPT_TYPE_VIDEO_RATE, {.str = "pal"}, 0, INT_MAX, DEC },
     { "video_size", "set video frame size", OFFSET(width), AV_OPT_TYPE_IMAGE_SIZE, {.str = NULL}, 0, 0, DEC },
     { "offset_x", "capture area x offset", OFFSET(offset_x), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC },
     { "offset_y", "capture area y offset", OFFSET(offset_y), AV_OPT_TYPE_INT, {.i64 = 0}, INT_MIN, INT_MAX, DEC },

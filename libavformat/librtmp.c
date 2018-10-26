@@ -24,6 +24,7 @@
  * RTMP protocol based on http://rtmpdump.mplayerhq.hu/ librtmp
  */
 
+#include <pthread.h>
 #include "libavutil/avstring.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
@@ -35,6 +36,9 @@
 
 #include <librtmp/rtmp.h>
 #include <librtmp/log.h>
+#include "libavutil/time.h"
+
+#define SND_BUF_SIZE        (1024 * 1024)
 
 typedef struct LibRTMPContext {
     const AVClass *class;
@@ -52,7 +56,110 @@ typedef struct LibRTMPContext {
     int live;
     char *temp_filename;
     int buffer_size;
+	uint8_t *snd_buf;
+	int snd_buf_wrptr;
+	int snd_buf_rdptr;
+	int frm_len[2048];
+	int tot_frm;
+	pthread_mutex_t mutex_snd_buf;
+	pthread_t pth;
+	int running;
 } LibRTMPContext;
+
+static void *rtmp_write_thread(void *parameter)
+{
+	LibRTMPContext *ctx = (LibRTMPContext *)parameter;
+	RTMP *r = &ctx->rtmp;
+	uint8_t *buf;
+
+	buf = (uint8_t *)malloc(SND_BUF_SIZE);
+	while(ctx->running == 1)
+	{
+		int size;
+
+		pthread_mutex_lock(&ctx->mutex_snd_buf);
+		if(ctx->snd_buf_rdptr > ctx->snd_buf_wrptr)
+			size = SND_BUF_SIZE - (ctx->snd_buf_rdptr - ctx->snd_buf_wrptr);
+		else
+			size = ctx->snd_buf_wrptr - ctx->snd_buf_rdptr;
+
+		if(size > 0)
+		{
+			int len = SND_BUF_SIZE - ctx->snd_buf_rdptr;
+			
+			if(size > ctx->frm_len[0])
+				size = ctx->frm_len[0];
+			if(size > len)
+			{
+				memcpy(buf, ctx->snd_buf + ctx->snd_buf_rdptr, len);
+				memcpy(buf + len, ctx->snd_buf, size - len);
+			}
+			else
+			{
+				memcpy(buf, ctx->snd_buf + ctx->snd_buf_rdptr, size);
+			}
+		}
+		pthread_mutex_unlock(&ctx->mutex_snd_buf);
+
+		if(size <= 0)
+		{
+			av_usleep(10000);
+			continue;
+		}
+		size = RTMP_Write(r, buf, size);
+		if(size == 0)
+		{
+			pthread_mutex_lock(&ctx->mutex_snd_buf);
+			if(ctx->tot_frm > 1)
+			{
+				int i;
+
+				ctx->frm_len[1] += ctx->frm_len[0];
+				ctx->tot_frm--;
+				for(i = 0; i < ctx->tot_frm; i++)
+					ctx->frm_len[i] = ctx->frm_len[i + 1];
+				pthread_mutex_unlock(&ctx->mutex_snd_buf);
+				continue;
+			}
+			pthread_mutex_unlock(&ctx->mutex_snd_buf);
+			av_usleep(10000);
+			continue;
+		}
+		else if(size < 0)
+		{
+			av_log(NULL, AV_LOG_ERROR, "rtmp write error, %d!\n", size);
+			break;
+		}
+
+		pthread_mutex_lock(&ctx->mutex_snd_buf);
+		if(size > ctx->frm_len[0])
+			size = ctx->frm_len[0];
+		ctx->snd_buf_rdptr += size;
+		if(ctx->snd_buf_rdptr >= SND_BUF_SIZE)
+			ctx->snd_buf_rdptr -= SND_BUF_SIZE;
+		ctx->frm_len[0] -= size;
+		if(ctx->frm_len[0] <= 0)
+		{
+			int i;
+
+			ctx->tot_frm--;
+			for(i = 0; i < ctx->tot_frm; i++)
+				ctx->frm_len[i] = ctx->frm_len[i + 1];
+		}
+		pthread_mutex_unlock(&ctx->mutex_snd_buf);
+	}
+
+	av_log(NULL, AV_LOG_WARNING, "exit rtmp write thread!\n");
+	pthread_mutex_lock(&ctx->mutex_snd_buf);
+	ctx->running = 0;
+	ctx->snd_buf_rdptr = 0;
+	ctx->snd_buf_wrptr = 0;
+	pthread_mutex_unlock(&ctx->mutex_snd_buf);
+
+	free(buf);
+	pthread_exit(0);
+	return NULL;
+}
 
 static void rtmp_log(int level, const char *fmt, va_list args)
 {
@@ -75,6 +182,12 @@ static int rtmp_close(URLContext *s)
     LibRTMPContext *ctx = s->priv_data;
     RTMP *r = &ctx->rtmp;
 
+	ctx->running = 0;
+    if(ctx->pth)
+    {
+        pthread_join(ctx->pth,NULL);
+    }
+	free(ctx->snd_buf);
     RTMP_Close(r);
     av_freep(&ctx->temp_filename);
     return 0;
@@ -246,6 +359,13 @@ static int rtmp_open(URLContext *s, const char *uri, int flags)
     }
 #endif
 
+    ctx->snd_buf = (uint8_t *)malloc(SND_BUF_SIZE);
+    ctx->snd_buf_rdptr = 0;
+    ctx->snd_buf_wrptr = 0;
+    ctx->mutex_snd_buf = PTHREAD_MUTEX_INITIALIZER;
+    ctx->running = 1;
+	ctx->tot_frm = 0;
+    pthread_create(&ctx->pth, NULL, rtmp_write_thread, ctx);
     s->is_streamed = 1;
     return 0;
 fail:
@@ -259,9 +379,48 @@ fail:
 static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
 {
     LibRTMPContext *ctx = s->priv_data;
-    RTMP *r = &ctx->rtmp;
+	int buf_size, tot_frm;
 
-    return RTMP_Write(r, buf, size);
+	while(ctx->running == 1)
+	{
+		pthread_mutex_lock(&ctx->mutex_snd_buf);
+		if(ctx->snd_buf_rdptr > ctx->snd_buf_wrptr)
+			buf_size = ctx->snd_buf_rdptr - ctx->snd_buf_wrptr;
+		else
+			buf_size = SND_BUF_SIZE - (ctx->snd_buf_wrptr - ctx->snd_buf_rdptr);
+		tot_frm = ctx->tot_frm;
+		pthread_mutex_unlock(&ctx->mutex_snd_buf);
+
+		if(buf_size > size && tot_frm < sizeof(ctx->frm_len) / sizeof(ctx->frm_len[0]))
+			break;
+		av_usleep(10000);
+	}
+
+	pthread_mutex_lock(&ctx->mutex_snd_buf);
+	if(ctx->running != 1)
+	{
+        av_log(NULL, AV_LOG_WARNING, "rtmp write thread is not running!\n");
+		pthread_mutex_unlock(&ctx->mutex_snd_buf);
+		return -1;
+	}
+	buf_size = SND_BUF_SIZE - ctx->snd_buf_wrptr;
+	if(buf_size >= size)
+	{
+		memcpy(ctx->snd_buf + ctx->snd_buf_wrptr, buf, size);
+	}
+	else
+	{
+		memcpy(ctx->snd_buf + ctx->snd_buf_wrptr, buf, buf_size);
+		memcpy(ctx->snd_buf, buf + buf_size, size - buf_size);
+	}
+	ctx->snd_buf_wrptr += size;
+	if(ctx->snd_buf_wrptr >= SND_BUF_SIZE)
+		ctx->snd_buf_wrptr -= SND_BUF_SIZE;
+	ctx->frm_len[ctx->tot_frm++] = size;
+	pthread_mutex_unlock(&ctx->mutex_snd_buf);
+
+	return size;
+    //return RTMP_Write(r, buf, size);
 }
 
 static int rtmp_read(URLContext *s, uint8_t *buf, int size)

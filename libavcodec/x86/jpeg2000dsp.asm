@@ -142,3 +142,9 @@ RCT_INT
 INIT_YMM avx2
 RCT_INT
 %endif
+
+%if ARCH_X86_64
+%else
+%include "jccolor-sse2.asm"
+%include "jccolor-mmx.asm"
+%endif
